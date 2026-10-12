@@ -153,6 +153,13 @@ def _undo_created_record(db: Session, record, equipment_id, snapshot):
         db.rollback()
 
 
+def _error_detail(e: Exception) -> str:
+    """The technical text of an error (it can contain SQL and table names) is shown only in development;
+    it is always written to the server log."""
+    from app.core.config import settings
+    return f" ({e})" if settings.APP_ENV == "development" else ""
+
+
 def create_inspection_record(db: Session, data: InspectionRecordCreate) -> InspectionRecord:
     # Fetch parent equipment for nominal and min required thickness
     equipment = db.query(Equipment).filter(Equipment.id == data.equipment_id).first()
@@ -262,7 +269,7 @@ def create_inspection_record(db: Session, data: InspectionRecordCreate) -> Inspe
         import logging
         logging.getLogger("ams.inspection").exception("CML sync failed while creating an inspection")
         _undo_created_record(db, record, data.equipment_id, cml_snapshot)
-        raise RuntimeError(f"Calculation could not be completed ({e}). The inspection was not saved.") from e
+        raise RuntimeError(f"Calculation could not be completed{_error_detail(e)}. The inspection was not saved.") from e
 
     record.tml_readings = populate_record_tml_readings(db, record)
     return record
@@ -446,7 +453,7 @@ def update_inspection_record(db: Session, record_id: uuid.UUID, data: Inspection
         logging.getLogger("ams.inspection").exception("CML sync failed while updating an inspection")
         db.rollback()
         raise RuntimeError(
-            f"The readings were saved but the calculation could not be completed ({e}). "
+            f"The readings were saved but the calculation could not be completed{_error_detail(e)}. "
             f"Open the record and save it again to retry."
         ) from e
 

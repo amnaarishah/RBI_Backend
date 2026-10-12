@@ -73,6 +73,49 @@ def create_inspection_record(
         raise _server_error("Failed to save inspection record", err)
 
 
+@router.get("/sample-template")
+def download_sample_template():
+    """Generate and return a downloadable sample Excel template for inspection logging."""
+    import io
+    from openpyxl import Workbook
+    from fastapi.responses import StreamingResponse
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Inspection Data Template"
+
+    headers = [
+        "Equipment Tag", "Inspection Date", "Inspector Name", "TML Code", "TML Name",
+        "TML Type", "Direction Labels", "Reading 1", "Reading 2", "Reading 3", "Reading 4", "Remarks"
+    ]
+    ws.append(headers)
+
+    sample_rows = [
+        ["00-V-15", "2026-08-08", "John Doe", "S-1", "Shell Course 1", "Shell", "0, 90, 180, 270", 11.97, 11.95, 11.86, 11.17, "Routine UT Measurement"],
+        ["00-V-15", "2026-08-08", "John Doe", "S-2", "Shell Course 2", "Shell", "0, 90, 180, 270", 12.06, 11.94, 11.91, 11.89, ""],
+        ["00-V-15", "2026-08-08", "John Doe", "D-1", "Upper Dish Head", "Dish", "0, 90, 180, 270", 11.77, 11.77, 11.78, 11.60, ""],
+        ["00-V-15", "2026-08-08", "John Doe", "D-2", "Lower Dish Head", "Dish", "0, 90, 180, 270", 11.56, 11.54, 11.41, 11.09, "Controlling location"],
+        ["00-V-002", "2026-08-08", "Sarah Smith", "S-1", "Shell Course 1", "Shell", "N, S, E, W", 6.10, 6.08, 6.02, 5.95, "Baseline inspection"],
+        ["00-V-002", "2026-08-08", "Sarah Smith", "D-1", "Upper Dish Head", "Dish", "N, S, E, W", 6.05, 6.04, 6.03, 6.02, ""],
+    ]
+
+    for r in sample_rows:
+        ws.append(r)
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    headers_response = {
+        'Content-Disposition': 'attachment; filename="Inspection_Import_Sample_Template.xlsx"'
+    }
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers_response
+    )
+
+
 @router.get("/{record_id}", response_model=InspectionRecordResponse)
 def get_inspection_record(
     record_id: uuid.UUID,
@@ -133,47 +176,3 @@ async def import_inspection_excel(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
     except Exception as err:
         raise _server_error("Failed to import file", err)
-
-
-@router.get("/sample-template")
-def download_sample_template():
-    """Generate and return a downloadable sample Excel template for inspection logging."""
-    import io
-    from openpyxl import Workbook
-    from fastapi.responses import StreamingResponse
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Inspection Data Template"
-
-    headers = [
-        "Equipment Tag", "Inspection Date", "Inspector Name", "TML Code", "TML Name",
-        "TML Type", "Direction Labels", "Reading 1", "Reading 2", "Reading 3", "Reading 4", "Remarks"
-    ]
-    ws.append(headers)
-
-    sample_rows = [
-        ["00-V-15", "2026-08-08", "John Doe", "S-1", "Shell Course 1", "Shell", "0, 90, 180, 270", 11.97, 11.95, 11.86, 11.17, "Routine UT Measurement"],
-        ["00-V-15", "2026-08-08", "John Doe", "S-2", "Shell Course 2", "Shell", "0, 90, 180, 270", 12.06, 11.94, 11.91, 11.89, ""],
-        ["00-V-15", "2026-08-08", "John Doe", "D-1", "Upper Dish Head", "Dish", "0, 90, 180, 270", 11.77, 11.77, 11.78, 11.60, ""],
-        ["00-V-15", "2026-08-08", "John Doe", "D-2", "Lower Dish Head", "Dish", "0, 90, 180, 270", 11.56, 11.54, 11.41, 11.09, "Controlling location"],
-        ["00-V-002", "2026-08-08", "Sarah Smith", "S-1", "Shell Course 1", "Shell", "N, S, E, W", 6.10, 6.08, 6.02, 5.95, "Baseline inspection"],
-        ["00-V-002", "2026-08-08", "Sarah Smith", "D-1", "Upper Dish Head", "Dish", "N, S, E, W", 6.05, 6.04, 6.03, 6.02, ""],
-    ]
-
-    for r in sample_rows:
-        ws.append(r)
-
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
-
-    headers_response = {
-        'Content-Disposition': 'attachment; filename="Inspection_Import_Sample_Template.xlsx"'
-    }
-    return StreamingResponse(
-        stream,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers=headers_response
-    )
-
