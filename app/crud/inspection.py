@@ -339,9 +339,13 @@ def get_inspection_list(
     db: Session,
     equipment_tag: str = None,
     page: int = 1,
-    page_size: int = 25
+    page_size: int = 25,
+    equipment_id=None,
 ):
     query = db.query(InspectionRecord)
+    if equipment_id:
+        # exact equipment (the history of ONE equipment); a tag filter is a "contains" search and can match others
+        query = query.filter(InspectionRecord.equipment_id == equipment_id)
     if equipment_tag:
         query = query.filter(InspectionRecord.equipment_tag.ilike(f"%{equipment_tag}%"))
 

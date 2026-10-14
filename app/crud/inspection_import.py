@@ -91,6 +91,13 @@ def import_inspections_from_excel(db: Session, file_contents: bytes, filename: s
             pass
         return None
 
+    # The inspection template (one row per zone) is read strictly: fixed column names, a closed list of zone types,
+    # every problem reported with its row, nothing imported when any row is wrong. Other layouts go to the readers below.
+    from app.crud.inspection_template import run_template_import
+    template_result = run_template_import(db, file_contents, filename)
+    if template_result is not None:
+        return template_result
+
     rows_data = []
     is_csv = filename.lower().endswith(".csv")
 
@@ -743,6 +750,7 @@ def import_inspections_from_excel(db: Session, file_contents: bytes, filename: s
         row_vals = list(row.values())
 
         processed_zones = set()
+        row_added = False
 
         for col_idx, h in enumerate(row_keys):
             h_str = str(h or "").strip()
@@ -773,6 +781,7 @@ def import_inspections_from_excel(db: Session, file_contents: bytes, filename: s
                 r4 = parse_decimal(row_vals[col_idx + 3]) if col_idx + 3 < len(row_vals) else None
 
                 if any(r is not None for r in [r1, r2, r3, r4]):
+                    row_added = True
                     grp["tml_readings"].append(
                         DynamicTMLReadingInput(
                             tml_code=code,
@@ -786,35 +795,50 @@ def import_inspections_from_excel(db: Session, file_contents: bytes, filename: s
                         )
                     )
 
-        # Fallback 1: Check for explicit single zone-based row layout columns
-        if not grp["tml_readings"]:
-            tml_code = get_field_val(normalized_row, ["tmlcode", "zonecode", "tml", "zone", "location", "tmlid"])
+        # Fallback 1: one zone per row, the columns under their own names (TML Code, TML Type, Reading 1 ...)
+        row_added_fb1 = False
+        if not row_added:
+            def exact_val(names):
+                for key, val in normalized_row.items():
+                    if key in names and val is not None and str(val).strip() != "":
+                        return val
+                return None
+
+            tml_code = exact_val(("tmlcode", "zonecode", "cmlcode", "tmlid"))
             if tml_code:
+                from app.crud.inspection_template import _TYPE_ALIASES
                 tml_code = str(tml_code).strip()
-                tml_name = str(get_field_val(normalized_row, ["tmlname", "zonename", "locationname"]) or tml_code).strip()
-                tml_type = str(get_field_val(normalized_row, ["tmltype", "componenttype", "component"]) or "Shell").strip()
-                orientations = str(get_field_val(normalized_row, ["directionlabels", "direction", "orientations", "points", "labels"]) or "N,S,E,W").strip()
-
-                r1 = parse_decimal(get_field_val(normalized_row, ["reading1", "r1", "north", "n", "deg0", "p1", "point1"]))
-                r2 = parse_decimal(get_field_val(normalized_row, ["reading2", "r2", "south", "s", "deg90", "p2", "point2"]))
-                r3 = parse_decimal(get_field_val(normalized_row, ["reading3", "r3", "east", "e", "deg180", "p3", "point3"]))
-                r4 = parse_decimal(get_field_val(normalized_row, ["reading4", "r4", "west", "w", "deg270", "p4", "point4"]))
-
-                grp["tml_readings"].append(
-                    DynamicTMLReadingInput(
-                        tml_code=tml_code,
-                        tml_name=tml_name,
-                        tml_type=tml_type,
-                        direction_labels=orientations,
-                        reading_1=r1,
-                        reading_2=r2,
-                        reading_3=r3,
-                        reading_4=r4,
-                    )
-                )
+                type_raw = exact_val(("tmltype", "componenttype", "zonetype"))
+                tml_type = _TYPE_ALIASES.get(norm(type_raw)) if type_raw else None
+                if not tml_type:
+                    errors.append(f"Row {idx}: zone '{tml_code}' has no valid TML Type"
+                                  f"{' (' + str(type_raw) + ')' if type_raw else ''}. The row was not imported.")
+                else:
+                    tml_name = str(exact_val(("tmlname", "zonename")) or tml_code).strip()
+                    orientations = str(exact_val(("directionlabels", "orientations")) or "N,S,E,W").strip()
+                    r1 = parse_decimal(exact_val(("reading1", "r1", "north", "n", "deg0", "p1", "point1")))
+                    r2 = parse_decimal(exact_val(("reading2", "r2", "south", "s", "deg90", "p2", "point2")))
+                    r3 = parse_decimal(exact_val(("reading3", "r3", "east", "e", "deg180", "p3", "point3")))
+                    r4 = parse_decimal(exact_val(("reading4", "r4", "west", "w", "deg270", "p4", "point4")))
+                    if any(v is not None for v in (r1, r2, r3, r4)):
+                        row_added_fb1 = True
+                        grp["tml_readings"].append(
+                            DynamicTMLReadingInput(
+                                tml_code=tml_code,
+                                tml_name=tml_name,
+                                tml_type=tml_type,
+                                direction_labels=orientations,
+                                reading_1=r1,
+                                reading_2=r2,
+                                reading_3=r3,
+                                reading_4=r4,
+                            )
+                        )
+                    else:
+                        errors.append(f"Row {idx}: zone '{tml_code}' has no readable thickness. The row was not imported.")
 
         # Fallback 2: Check for flat layout columns (S1_N, S1_S, S1_E, S1_W, etc.)
-        if not grp["tml_readings"]:
+        if not row_added and not row_added_fb1:
             for key_prefix, code, name, t_type in [
                 ("s1", "S-1", "Shell Course 1", "Shell"),
                 ("s2", "S-2", "Shell Course 2", "Shell"),
@@ -854,6 +878,10 @@ def import_inspections_from_excel(db: Session, file_contents: bytes, filename: s
 
         if not equipment:
             errors.append(f"Equipment '{grp['eq_tag']}' not found in Database. Skipped inspection for {insp_date_str}.")
+            continue
+
+        if not grp["tml_readings"]:
+            errors.append(f"No readable thickness found for {grp['eq_tag']} on {insp_date_str}. No inspection was created for it.")
             continue
 
         # Build payload
@@ -912,5 +940,7 @@ def import_inspections_from_excel(db: Session, file_contents: bytes, filename: s
         "records_created": records_created,
         "records_updated": records_updated,
         "errors": errors,
+        "warnings": ["This file is not in the standard template layout, so the columns were recognised automatically. "
+                     "Please check the imported values. The template (Download Template) is read exactly."],
     }
 
