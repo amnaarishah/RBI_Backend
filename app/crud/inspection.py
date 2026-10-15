@@ -130,7 +130,8 @@ def _snapshot_cml(db: Session, equipment_id):
 
 
 def _undo_created_record(db: Session, record, equipment_id, snapshot):
-    """Remove everything a failed create produced (record, new readings, new zones)."""
+    """Remove everything a failed create produced (record, new readings, new zones).
+    `record` is None when the readings were being added to an inspection that already existed: that one stays."""
     from app.models.cml import InspectionTML, InspectionReading
     db.rollback()
     pre_tmls, pre_readings = snapshot
@@ -144,13 +145,40 @@ def _undo_created_record(db: Session, record, equipment_id, snapshot):
     if pre_tmls:
         q = q.filter(~InspectionTML.id.in_(pre_tmls))
     q.delete(synchronize_session=False)
-    db.query(InspectionRecord).filter(InspectionRecord.id == record.id).delete(synchronize_session=False)
+    if record is not None:
+        db.query(InspectionRecord).filter(InspectionRecord.id == record.id).delete(synchronize_session=False)
     db.commit()
     try:
         from app.crud.cml import recalculate_equipment_cmls
         recalculate_equipment_cmls(db, equipment_id)
     except Exception:
         db.rollback()
+
+
+def _submitted_zone_codes(data) -> list:
+    """Codes of the zones that carry at least one reading in this submission."""
+    if data.tml_readings:
+        return [t.tml_code for t in data.tml_readings
+                if any(v is not None for v in (t.reading_1, t.reading_2, t.reading_3, t.reading_4))]
+    return [code for code, _name, _type, prefix, _order in _LEGACY_ZONES
+            if any(getattr(data, f"{prefix}_{p}") is not None for p in _LEGACY_POINTS)]
+
+
+def _zones_already_read_on(db: Session, equipment_id, codes, start_of_day, end_of_day) -> list:
+    """Of these zone codes, the ones that already have a reading on that day."""
+    from app.models.cml import InspectionTML, InspectionReading
+    taken = []
+    for code in codes:
+        zone = db.query(InspectionTML).filter(InspectionTML.equipment_id == equipment_id, InspectionTML.tml_code == code).first()
+        if zone is None:
+            continue
+        if db.query(InspectionReading).filter(
+            InspectionReading.tml_id == zone.id,
+            InspectionReading.inspection_date >= start_of_day,
+            InspectionReading.inspection_date <= end_of_day,
+        ).first() is not None:
+            taken.append(code)
+    return taken
 
 
 def _error_detail(e: Exception) -> str:
@@ -160,63 +188,64 @@ def _error_detail(e: Exception) -> str:
     return f" ({e})" if settings.APP_ENV == "development" else ""
 
 
+def _add_zones_to_existing_inspection(db: Session, equipment: Equipment, record: InspectionRecord,
+                                      data: InspectionRecordCreate) -> InspectionRecord:
+    """Zones that have no reading yet on the date of an existing inspection are added to THAT inspection (one
+    inspection per equipment and date): the readings go into the CML tables, the record's lowest reading is updated."""
+    tag = data.equipment_tag or equipment.equipment_id
+    snapshot = _snapshot_cml(db, data.equipment_id)
+    try:
+        _sync_cml_readings(db, equipment, data, tag, create_missing_legacy_zones=True)
+    except Exception as e:
+        import logging
+        logging.getLogger("ams.inspection").exception("CML sync failed while adding zones to an inspection")
+        _undo_created_record(db, None, data.equipment_id, snapshot)
+        raise RuntimeError(f"Calculation could not be completed{_error_detail(e)}. Nothing was saved.") from e
+
+    db.refresh(record)
+    new_lowest = min(_collect_readings(data))
+    record.min_measured_thickness = new_lowest if record.min_measured_thickness is None else min(record.min_measured_thickness, new_lowest)
+    for field, value in _legacy_fields(data).items():
+        if value is not None:
+            setattr(record, field, value)
+    if data.remarks and data.remarks not in (record.remarks or ""):
+        record.remarks = f"{record.remarks} | {data.remarks}" if record.remarks else data.remarks
+    db.commit()
+    db.refresh(record)
+    record.tml_readings = populate_record_tml_readings(db, record)
+    return record
+
+
 def create_inspection_record(db: Session, data: InspectionRecordCreate) -> InspectionRecord:
     # Fetch parent equipment for nominal and min required thickness
     equipment = db.query(Equipment).filter(Equipment.id == data.equipment_id).first()
     if not equipment:
         raise ValueError("Target equipment not found")
 
-    # Check for existing inspection record on same date
+    # An inspection without a single thickness reading is not an inspection (an empty form must not create a record)
+    readings = _collect_readings(data)
+    if not readings:
+        raise ValueError("Enter at least one thickness reading. Nothing was saved.")
+
+    # One inspection record per equipment and date: a second one is refused, the existing one is edited instead
     insp_date = data.inspection_date.date() if isinstance(data.inspection_date, datetime) else data.inspection_date
     start_of_day = datetime.combine(insp_date, datetime.min.time())
     end_of_day = datetime.combine(insp_date, datetime.max.time())
-    
+
     existing = db.query(InspectionRecord).filter(
         InspectionRecord.equipment_id == data.equipment_id,
         InspectionRecord.inspection_date >= start_of_day,
         InspectionRecord.inspection_date <= end_of_day
     ).first()
-    
-    if existing and data.tml_readings:
-        # Record exists on same date — check if user is trying to add a NEW zone
-        # or re-submitting an ALREADY RECORDED zone (which we block)
-        from app.models.cml import InspectionTML, InspectionReading
+    if existing:
         formatted_date = insp_date.strftime('%d-%b-%Y') if hasattr(insp_date, 'strftime') else str(insp_date)
-        
-        duplicate_zones = []
-        for tml_in in data.tml_readings:
-            if not tml_in.tml_code:
-                continue
-            # Check if this zone already has a reading on this date
-            existing_tml = db.query(InspectionTML).filter(
-                InspectionTML.equipment_id == data.equipment_id,
-                InspectionTML.tml_code == tml_in.tml_code
-            ).first()
-            if existing_tml:
-                d_start = start_of_day
-                d_end = end_of_day
-                existing_reading = db.query(InspectionReading).filter(
-                    InspectionReading.tml_id == existing_tml.id,
-                    InspectionReading.inspection_date >= d_start,
-                    InspectionReading.inspection_date <= d_end
-                ).first()
-                if existing_reading:
-                    duplicate_zones.append(tml_in.tml_code)
-        
-        if duplicate_zones:
-            zone_list = ", ".join(duplicate_zones)
+        taken = _zones_already_read_on(db, data.equipment_id, _submitted_zone_codes(data), start_of_day, end_of_day)
+        if taken:
             raise ValueError(
-                f"Zone(s) '{zone_list}' already have readings recorded for {equipment.equipment_id} "
-                f"on {formatted_date}. To change them, please edit the existing record."
+                f"Zone(s) {', '.join(taken)} of {equipment.equipment_id} already have readings on {formatted_date}. "
+                f"To change them open that inspection with Edit. Nothing was saved."
             )
-        # No duplicates — fall through and add new zones to the existing record below
-    
-    elif existing and not data.tml_readings:
-        # Legacy path (non-dynamic zones) — block same date
-        formatted_date = insp_date.strftime('%d-%b-%Y') if hasattr(insp_date, 'strftime') else str(insp_date)
-        raise ValueError(f"An inspection record already exists for {equipment.equipment_id} on {formatted_date}. Please select a different date.")
-
-    readings = _collect_readings(data)
+        return _add_zones_to_existing_inspection(db, equipment, existing, data)
 
     # Corrosion rate and remaining life are NOT estimated here. They are calculated by the
     # CML engine (client sheet method: Ti / Tp / Tf, MAX(short-term, long-term) and the
@@ -304,6 +333,7 @@ def populate_record_tml_readings(db: Session, record: InspectionRecord):
                 reading_4=rd.reading_4,
                 reading_5=rd.reading_5,
                 reading_6=rd.reading_6,
+                min_required_thickness=tml.min_required_thickness,      # so Edit shows the same t_min as the new-inspection form
             ))
     else:
         legacy_zones = [
@@ -404,6 +434,8 @@ def update_inspection_record(db: Session, record_id: uuid.UUID, data: Inspection
         raise ValueError(f"Another inspection record already exists for {equipment.equipment_id} on {formatted_date}.")
 
     readings = _collect_readings(data)
+    if not readings:
+        raise ValueError("An inspection needs at least one thickness reading. To remove the inspection use Delete. Nothing was changed.")
 
     # Corrosion rate and remaining life are NOT estimated here. They are calculated by the
     # CML engine (client sheet method: Ti / Tp / Tf, MAX(short-term, long-term) and the
